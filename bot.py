@@ -449,6 +449,20 @@ async def setuproles(interaction: discord.Interaction):
         await interaction.followup.send("✅ All roles already exist!", ephemeral=True)
 
 
+# ── ERROR HANDLER ─────────────────────────────────────────────────────────────
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = f"❌ Error: {str(error)}"
+    try:
+        await interaction.followup.send(msg, ephemeral=True)
+    except Exception:
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+    raise error
+
+
 # ── RUN ───────────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
