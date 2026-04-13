@@ -1,9 +1,9 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 CLIPS_CHANNEL_NAME = "submit-clips"
@@ -23,6 +23,8 @@ LEADERBOARD_ROLES = {
     2: "🥈 #2 Clipper",
     3: "🥉 #3 Clipper",
 }
+
+MILESTONES = [10, 25, 50, 100, 200, 500]
 
 # ── DATA ─────────────────────────────────────────────────────────────────────
 def load_data():
@@ -66,6 +68,7 @@ async def on_ready():
         print(f"✅ Synced {len(synced)} slash commands")
     except Exception as e:
         print(f"❌ Sync error: {e}")
+    weekly_leaderboard.start()
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -75,7 +78,6 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Check if message has an attachment or link (a clip)
     has_clip = bool(message.attachments) or any(
         x in message.content for x in ["http://", "https://", "www."]
     )
@@ -87,22 +89,72 @@ async def on_message(message: discord.Message):
     uid = str(message.author.id)
 
     if uid not in data:
-        data[uid] = {"clips": 0, "username": str(message.author), "level": 0}
+        data[uid] = {
+            "clips": 0,
+            "username": str(message.author),
+            "level": 0,
+            "submitted_links": [],
+            "streak": 0,
+            "last_clip_date": None,
+        }
+
+    # ── Duplicate link detection ──
+    if not message.attachments:
+        link = next((w for w in message.content.split() if w.startswith(("http://", "https://", "www."))), None)
+        if link and link in data[uid].get("submitted_links", []):
+            await message.reply("⚠️ You've already submitted that clip! Please share a new one.", mention_author=True)
+            return
+        if link:
+            data[uid].setdefault("submitted_links", []).append(link)
 
     old_clips = data[uid]["clips"]
     data[uid]["clips"] += 1
     data[uid]["username"] = str(message.author)
     new_clips = data[uid]["clips"]
 
+    # ── Streak tracking ──
+    today = datetime.now(timezone.utc).date().isoformat()
+    last_date = data[uid].get("last_clip_date")
+    if last_date is None:
+        data[uid]["streak"] = 1
+    else:
+        last = datetime.fromisoformat(last_date).date()
+        diff = (datetime.now(timezone.utc).date() - last).days
+        if diff == 0:
+            pass  # same day, streak unchanged
+        elif diff == 1:
+            data[uid]["streak"] = data[uid].get("streak", 0) + 1
+        else:
+            data[uid]["streak"] = 1
+    data[uid]["last_clip_date"] = today
+
     old_level_info = get_level(old_clips)
     new_level_info = get_level(new_clips)
-
     old_level = old_level_info["level"] if old_level_info else 0
     new_level = new_level_info["level"] if new_level_info else 0
 
     save_data(data)
 
-    # Level up!
+    # ── Auto react ──
+    await message.add_reaction("🎬")
+
+    ann_channel = discord.utils.get(message.guild.text_channels, name=ANNOUNCEMENTS_CHANNEL_NAME)
+
+    # ── Milestone messages ──
+    if new_clips in MILESTONES:
+        if ann_channel:
+            embed = discord.Embed(
+                title="🏅 Milestone Reached!",
+                description=(
+                    f"🎉 {message.author.mention} just hit **{new_clips} clips!** What a legend! 🔥"
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow()
+            )
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            await ann_channel.send(embed=embed)
+
+    # ── Level up ──
     if new_level > old_level:
         data[uid]["level"] = new_level
         save_data(data)
@@ -110,18 +162,14 @@ async def on_message(message: discord.Message):
         guild = message.guild
         member = message.author
 
-        # Assign new role
         new_role = discord.utils.get(guild.roles, name=new_level_info["role"])
         if new_role:
-            # Remove old level roles
             for lvl in LEVELS:
                 old_role = discord.utils.get(guild.roles, name=lvl["role"])
                 if old_role and old_role in member.roles:
                     await member.remove_roles(old_role)
             await member.add_roles(new_role)
 
-        # Announce
-        ann_channel = discord.utils.get(guild.text_channels, name=ANNOUNCEMENTS_CHANNEL_NAME)
         if ann_channel:
             next_lvl = get_next_level(new_clips)
             next_text = f"Next level at **{next_lvl['clips']} clips**." if next_lvl else "You've reached the **max level!** 🏆"
@@ -139,24 +187,20 @@ async def on_message(message: discord.Message):
             embed.set_thumbnail(url=member.display_avatar.url)
             await ann_channel.send(embed=embed)
 
-        # Update leaderboard roles
         await update_leaderboard_roles(guild, data)
 
     await bot.process_commands(message)
 
 
 async def update_leaderboard_roles(guild: discord.Guild, data: dict):
-    """Assign #1, #2, #3 Clipper roles based on clip count."""
     sorted_users = sorted(data.items(), key=lambda x: x[1]["clips"], reverse=True)
 
-    # Remove all leaderboard roles first
     for rank, role_name in LEADERBOARD_ROLES.items():
         role = discord.utils.get(guild.roles, name=role_name)
         if role:
             for member in role.members:
                 await member.remove_roles(role)
 
-    # Assign top 3
     for i, (uid, udata) in enumerate(sorted_users[:3], start=1):
         role_name = LEADERBOARD_ROLES.get(i)
         if not role_name:
@@ -165,6 +209,40 @@ async def update_leaderboard_roles(guild: discord.Guild, data: dict):
         member = guild.get_member(int(uid))
         if role and member:
             await member.add_roles(role)
+
+
+# ── WEEKLY LEADERBOARD TASK ───────────────────────────────────────────────────
+@tasks.loop(hours=24)
+async def weekly_leaderboard():
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 6:  # 6 = Sunday
+        return
+
+    data = load_data()
+    if not data:
+        return
+
+    for guild in bot.guilds:
+        ann_channel = discord.utils.get(guild.text_channels, name=ANNOUNCEMENTS_CHANNEL_NAME)
+        if not ann_channel:
+            continue
+
+        sorted_users = sorted(data.items(), key=lambda x: x[1]["clips"], reverse=True)
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        description = ""
+        for i, (uid, udata) in enumerate(sorted_users[:10], start=1):
+            medal = medals.get(i, f"**#{i}**")
+            level_info = get_level(udata["clips"])
+            level_str = f" • {level_info['role']}" if level_info else ""
+            description += f"{medal} <@{uid}> — **{udata['clips']} clips**{level_str}\n"
+
+        embed = discord.Embed(
+            title="📅 Weekly Leaderboard",
+            description=description or "No data yet.",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        await ann_channel.send(embed=embed)
 
 
 # ── SLASH COMMANDS ────────────────────────────────────────────────────────────
@@ -190,7 +268,9 @@ async def leaderboard(interaction: discord.Interaction):
         medal = medals.get(i, f"**#{i}**")
         level_info = get_level(udata["clips"])
         level_str = f" • {level_info['role']}" if level_info else ""
-        description += f"{medal} <@{uid}> — **{udata['clips']} clips**{level_str}\n"
+        streak = udata.get("streak", 0)
+        streak_str = f" 🔥 {streak}d streak" if streak > 1 else ""
+        description += f"{medal} <@{uid}> — **{udata['clips']} clips**{level_str}{streak_str}\n"
 
     embed.description = description or "No data yet."
     await interaction.response.send_message(embed=embed)
@@ -209,6 +289,7 @@ async def mystats(interaction: discord.Interaction):
     clips = udata["clips"]
     level_info = get_level(clips)
     next_level_info = get_next_level(clips)
+    streak = udata.get("streak", 0)
 
     embed = discord.Embed(
         title=f"📊 {interaction.user.display_name}'s Stats",
@@ -217,6 +298,7 @@ async def mystats(interaction: discord.Interaction):
     )
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     embed.add_field(name="🎬 Total Clips", value=str(clips), inline=True)
+    embed.add_field(name="🔥 Streak", value=f"{streak} day(s)", inline=True)
 
     if level_info:
         embed.add_field(name="⚡ Current Level", value=level_info["role"], inline=True)
@@ -233,7 +315,6 @@ async def mystats(interaction: discord.Interaction):
     else:
         embed.add_field(name="🏆 Status", value="Max level reached!", inline=False)
 
-    # Rank
     sorted_users = sorted(data.items(), key=lambda x: x[1]["clips"], reverse=True)
     rank = next((i+1 for i, (u, _) in enumerate(sorted_users) if u == uid), None)
     if rank:
@@ -249,7 +330,7 @@ async def addclips(interaction: discord.Interaction, member: discord.Member, amo
     uid = str(member.id)
 
     if uid not in data:
-        data[uid] = {"clips": 0, "username": str(member), "level": 0}
+        data[uid] = {"clips": 0, "username": str(member), "level": 0, "submitted_links": [], "streak": 0, "last_clip_date": None}
 
     old_clips = data[uid]["clips"]
     data[uid]["clips"] = max(0, old_clips + amount)
@@ -280,6 +361,59 @@ async def addclips(interaction: discord.Interaction, member: discord.Member, amo
     )
 
 
+@tree.command(name="removeclips", description="[Admin] Remove clips from a user")
+@app_commands.checks.has_permissions(administrator=True)
+async def removeclips(interaction: discord.Interaction, member: discord.Member, amount: int):
+    data = load_data()
+    uid = str(member.id)
+
+    if uid not in data:
+        await interaction.response.send_message(f"{member.mention} has no clip data.", ephemeral=True)
+        return
+
+    old_clips = data[uid]["clips"]
+    data[uid]["clips"] = max(0, old_clips - amount)
+    new_clips = data[uid]["clips"]
+    save_data(data)
+
+    await update_leaderboard_roles(interaction.guild, data)
+    await interaction.response.send_message(
+        f"✅ Removed **{amount} clips** from {member.mention}. They now have **{new_clips} clips**.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="setclips", description="[Admin] Set a user's clip count to an exact number")
+@app_commands.checks.has_permissions(administrator=True)
+async def setclips(interaction: discord.Interaction, member: discord.Member, amount: int):
+    data = load_data()
+    uid = str(member.id)
+
+    if uid not in data:
+        data[uid] = {"clips": 0, "username": str(member), "level": 0, "submitted_links": [], "streak": 0, "last_clip_date": None}
+
+    data[uid]["clips"] = max(0, amount)
+    data[uid]["username"] = str(member)
+    save_data(data)
+
+    new_level_info = get_level(amount)
+    if new_level_info:
+        guild = interaction.guild
+        new_role = discord.utils.get(guild.roles, name=new_level_info["role"])
+        if new_role:
+            for lvl in LEVELS:
+                old_role = discord.utils.get(guild.roles, name=lvl["role"])
+                if old_role and old_role in member.roles:
+                    await member.remove_roles(old_role)
+            await member.add_roles(new_role)
+
+    await update_leaderboard_roles(interaction.guild, data)
+    await interaction.response.send_message(
+        f"✅ Set {member.mention}'s clips to **{amount}**.",
+        ephemeral=True
+    )
+
+
 @tree.command(name="resetuser", description="[Admin] Reset a user's clip count")
 @app_commands.checks.has_permissions(administrator=True)
 async def resetuser(interaction: discord.Interaction, member: discord.Member):
@@ -287,7 +421,6 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
     uid = str(member.id)
 
     if uid in data:
-        # Remove level roles
         for lvl in LEVELS:
             role = discord.utils.get(interaction.guild.roles, name=lvl["role"])
             if role and role in member.roles:
