@@ -28,9 +28,15 @@ MILESTONES = [10, 25, 50, 100, 200, 500]
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────────────────
 MONGO_URI = os.getenv("MONGODB_URI")
-mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-db = mongo_client["clipbot"]
-collection = db["users"]
+try:
+    mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+    mongo_client.admin.command("ping")  # Verify connection on startup
+    db = mongo_client["clipbot"]
+    collection = db["users"]
+    print("✅ Connected to MongoDB")
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    raise SystemExit(1)
 
 def load_data():
     return {u["_id"]: u for u in collection.find({})}
@@ -217,6 +223,7 @@ async def update_leaderboard_roles(guild: discord.Guild, data: dict):
 # ── WEEKLY LEADERBOARD TASK ───────────────────────────────────────────────────
 @tasks.loop(hours=24)
 async def weekly_leaderboard():
+  try:
     now = datetime.now(timezone.utc)
     if now.weekday() != 6:
         return
@@ -248,6 +255,8 @@ async def weekly_leaderboard():
             timestamp=datetime.utcnow()
         )
         await ann_channel.send(embed=embed)
+  except Exception as e:
+    print(f"❌ weekly_leaderboard error: {e}")
 
 
 # ── SLASH COMMANDS ────────────────────────────────────────────────────────────
@@ -454,13 +463,13 @@ async def setuproles(interaction: discord.Interaction):
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     msg = f"❌ Error: {str(error)}"
     try:
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception:
-        try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
             await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
-    raise error
+    except Exception as e:
+        print(f"❌ Could not send error message: {e}")
+    print(f"❌ App command error: {error}")
 
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
