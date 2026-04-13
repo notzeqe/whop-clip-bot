@@ -4,6 +4,7 @@ from discord import app_commands
 import os
 from datetime import datetime, timezone, date
 from pymongo import MongoClient
+import certifi
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 CLIPS_CHANNEL_NAME = "submit-clips"
@@ -27,7 +28,7 @@ MILESTONES = [10, 25, 50, 100, 200, 500]
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────────────────
 MONGO_URI = os.getenv("MONGODB_URI")
-mongo_client = MongoClient(MONGO_URI)
+mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = mongo_client["clipbot"]
 collection = db["users"]
 
@@ -253,9 +254,10 @@ async def weekly_leaderboard():
 
 @tree.command(name="leaderboard", description="Show the top clippers leaderboard")
 async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
     data = load_data()
     if not data:
-        await interaction.response.send_message("No clips recorded yet!", ephemeral=True)
+        await interaction.followup.send("No clips recorded yet!", ephemeral=True)
         return
 
     sorted_users = sorted(data.values(), key=lambda x: x["clips"], reverse=True)
@@ -275,16 +277,17 @@ async def leaderboard(interaction: discord.Interaction):
         timestamp=datetime.utcnow()
     )
     embed.description = description or "No data yet."
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="mystats", description="Check your clipping stats")
 async def mystats(interaction: discord.Interaction):
+    await interaction.response.defer()
     uid = str(interaction.user.id)
     user = collection.find_one({"_id": uid})
 
     if not user:
-        await interaction.response.send_message("You haven't submitted any clips yet!", ephemeral=True)
+        await interaction.followup.send("You haven't submitted any clips yet!", ephemeral=True)
         return
 
     clips = user["clips"]
@@ -321,12 +324,13 @@ async def mystats(interaction: discord.Interaction):
     if rank:
         embed.add_field(name="🏅 Server Rank", value=f"#{rank}", inline=True)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="addclips", description="[Admin] Manually add clips to a user")
 @app_commands.checks.has_permissions(administrator=True)
 async def addclips(interaction: discord.Interaction, member: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=True)
     uid = str(member.id)
     user = get_user(uid)
     user["username"] = str(member)
@@ -351,7 +355,7 @@ async def addclips(interaction: discord.Interaction, member: discord.Member, amo
             await member.add_roles(new_role)
 
     await update_leaderboard_roles(interaction.guild, load_data())
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Added **{amount} clips** to {member.mention}. They now have **{new_clips} clips**.",
         ephemeral=True
     )
@@ -360,11 +364,12 @@ async def addclips(interaction: discord.Interaction, member: discord.Member, amo
 @tree.command(name="removeclips", description="[Admin] Remove clips from a user")
 @app_commands.checks.has_permissions(administrator=True)
 async def removeclips(interaction: discord.Interaction, member: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=True)
     uid = str(member.id)
     user = collection.find_one({"_id": uid})
 
     if not user:
-        await interaction.response.send_message(f"{member.mention} has no clip data.", ephemeral=True)
+        await interaction.followup.send(f"{member.mention} has no clip data.", ephemeral=True)
         return
 
     user["clips"] = max(0, user["clips"] - amount)
@@ -372,7 +377,7 @@ async def removeclips(interaction: discord.Interaction, member: discord.Member, 
     save_user(user)
 
     await update_leaderboard_roles(interaction.guild, load_data())
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Removed **{amount} clips** from {member.mention}. They now have **{new_clips} clips**.",
         ephemeral=True
     )
@@ -381,6 +386,7 @@ async def removeclips(interaction: discord.Interaction, member: discord.Member, 
 @tree.command(name="setclips", description="[Admin] Set a user's clip count to an exact number")
 @app_commands.checks.has_permissions(administrator=True)
 async def setclips(interaction: discord.Interaction, member: discord.Member, amount: int):
+    await interaction.response.defer(ephemeral=True)
     uid = str(member.id)
     user = get_user(uid)
     user["username"] = str(member)
@@ -398,7 +404,7 @@ async def setclips(interaction: discord.Interaction, member: discord.Member, amo
             await member.add_roles(new_role)
 
     await update_leaderboard_roles(interaction.guild, load_data())
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Set {member.mention}'s clips to **{amount}**.",
         ephemeral=True
     )
@@ -407,6 +413,7 @@ async def setclips(interaction: discord.Interaction, member: discord.Member, amo
 @tree.command(name="resetuser", description="[Admin] Reset a user's clip count")
 @app_commands.checks.has_permissions(administrator=True)
 async def resetuser(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
     uid = str(member.id)
     user = collection.find_one({"_id": uid})
 
@@ -417,9 +424,9 @@ async def resetuser(interaction: discord.Interaction, member: discord.Member):
                 await member.remove_roles(role)
         collection.delete_one({"_id": uid})
         await update_leaderboard_roles(interaction.guild, load_data())
-        await interaction.response.send_message(f"✅ Reset {member.mention}'s clip data.", ephemeral=True)
+        await interaction.followup.send(f"✅ Reset {member.mention}'s clip data.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"{member.mention} has no data to reset.", ephemeral=True)
+        await interaction.followup.send(f"{member.mention} has no data to reset.", ephemeral=True)
 
 
 @tree.command(name="setuproles", description="[Admin] Create all level & leaderboard roles in the server")
